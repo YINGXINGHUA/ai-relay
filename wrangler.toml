@@ -11,5 +11,3 @@ binding = "DB"
 database_name = "ai-relay"
 migrations_dir = "migrations"
 
-[triggers]
-crons = ["0 0 * * *", "5 0 * * *"]
