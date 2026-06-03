@@ -236,7 +236,8 @@ export async function POST(request: NextRequest) {
 
   try {
     const startTime = Date.now();
-    const { response, provider, apiKey } = await relayRequest(body, 'anthropicMessages');
+    const userAgent = request.headers.get('user-agent') || undefined;
+    const { response, provider, apiKey } = await relayRequest(body, 'anthropicMessages', userAgent);
     const latencyMs = Date.now() - startTime;
 
     if (body.stream && response.ok && response.body) {

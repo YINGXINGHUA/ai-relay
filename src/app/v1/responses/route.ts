@@ -359,7 +359,8 @@ export async function POST(request: NextRequest) {
   // 4. Relay the request
   try {
     const startTime = Date.now();
-    const { response, provider, apiKey } = await relayRequest(body, 'responses');
+    const userAgent = request.headers.get('user-agent') || undefined;
+    const { response, provider, apiKey } = await relayRequest(body, 'responses', userAgent);
     const latencyMs = Date.now() - startTime;
 
     // 5. Stream or return the response
