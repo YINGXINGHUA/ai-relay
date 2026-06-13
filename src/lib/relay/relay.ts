@@ -237,38 +237,99 @@ export async function relayRequest(
   }
 
   let effectiveProvider = provider;
+
+  // Two mutually-exclusive routing modes determine effectiveProvider and fallbackNames.
+  //
+  //   Smart routing (config.enabled):
+  //     Smart routing fully takes over — it picks the primary provider from the
+  //     model-compatible candidate pool and supplies its own scored fallback
+  //     chain. Priority rules and traditional per-provider fallback config are
+  //     ignored entirely in this mode.
+  //
+  //   Traditional mode (default):
+  //     The provider resolved from the model name is used as-is. Its fallback
+  //     chain comes first from a matching priority rule's providerOrder (the
+  //     entries after the current provider), and falls back to the provider's
+  //     own configured/static fallback chain when no priority rule applies.
+  //
+  // The model used for compatibility filtering is the alias-resolved name, so a
+  // `claude-best` alias is restricted to providers that actually serve the real
+  // claude-* model rather than every configured provider.
   const smartRoutingConfigured = await isSmartRoutingConfigured();
+  let fallbackNames: string[] = [];
+
   if (smartRoutingConfigured) {
     try {
-      const routingDecision = await smartRoute(provider.name);
+      const resolvedForRouting = await resolveModelAlias(body.model);
+      const routingDecision = await smartRoute(provider.name, resolvedForRouting);
+      const allProviders = await getAllProviders();
       if (routingDecision.provider !== provider.name) {
-        const allProviders = await getAllProviders();
         const reroutedProvider = allProviders[routingDecision.provider];
         if (reroutedProvider) {
           console.log(`[smart-route] Rerouting ${provider.displayName} → ${reroutedProvider.displayName} (${routingDecision.reason})`);
           effectiveProvider = reroutedProvider;
         }
       }
+      // Smart routing supplies its own fallback chain (the remaining scored
+      // candidates). Filter to existing providers and drop the primary so the
+      // request has single-attempt failover within the model-compatible pool.
+      fallbackNames = routingDecision.fallbackChain
+        .filter((name) => allProviders[name] && name !== effectiveProvider.name);
+      console.log(`[smart-route] Fallback chain: ${fallbackNames.join(' → ') || 'none'}`);
+    } catch (e) {
+      console.error('[smart-route] Failed, falling back to traditional failover:', e);
+      try {
+        const { getFallbackChain } = await import('../admin/admin-config');
+        fallbackNames = await getFallbackChain(
+          effectiveProvider.name,
+          effectiveProvider.fallbackProviders || effectiveProvider.fallbackProvider
+        );
+      } catch {
+        // Fallback fallback is best effort
+      }
+    }
+  } else {
+    // Traditional mode: priority rule providerOrder first, then static fallback.
+    try {
+      const { getPriorityRules } = await import('../admin/admin-config');
+      const { findMatchingPriorityRule } = await import('../admin/priority-rules-core');
+      const resolvedForRule = (await resolveModelAlias(body.model)).toLowerCase();
+      const priorityRule = findMatchingPriorityRule(await getPriorityRules(), resolvedForRule);
+      if (priorityRule && priorityRule.providerOrder.length > 1) {
+        const currentIndex = priorityRule.providerOrder.indexOf(effectiveProvider.name);
+        const remaining = currentIndex >= 0
+          ? priorityRule.providerOrder.slice(currentIndex + 1)
+          : priorityRule.providerOrder.filter((name) => name !== effectiveProvider.name);
+        if (remaining.length > 0) {
+          const allProviders = await getAllProviders();
+          fallbackNames = remaining.filter((name) => allProviders[name]);
+          if (fallbackNames.length > 0) {
+            console.log(`[priority-fallback] Using providerOrder: ${fallbackNames.join(' → ')}`);
+          }
+        }
+      }
     } catch {
-      // Smart routing is non-blocking; fall through to original provider
+      // Priority rules are an optional override; ignore failures and fall back
+      // to the provider's own configured chain below.
+    }
+
+    if (fallbackNames.length === 0) {
+      const { getFallbackChain } = await import('../admin/admin-config');
+      fallbackNames = await getFallbackChain(
+        effectiveProvider.name,
+        effectiveProvider.fallbackProviders || effectiveProvider.fallbackProvider
+      );
     }
   }
 
   let primaryResult: { result: RelayResult | null; lastError: Error | null } = { result: null, lastError: null };
-
-  // Fetch fallback chain early to determine if we can fall back on rate limit/circuit breaker open
-  const { getDefaultConfigStore } = await import('../config-store');
-  const store = getDefaultConfigStore();
-  const staticFallbacks = effectiveProvider.fallbackProviders || (effectiveProvider.fallbackProvider ? [effectiveProvider.fallbackProvider] : []);
-  const fallbackNames = await store.getFallbackChain(effectiveProvider.name, staticFallbacks);
-  const effectiveFallbackNames = fallbackNames;
 
   // Pre-flight: check rate limiter (token bucket + circuit breaker)
   const rateLimitCheck = checkRateLimit(effectiveProvider.name);
 
   if (!rateLimitCheck.allowed) {
     // If no fallbacks are configured, fail immediately with 429
-    if (effectiveFallbackNames.length === 0) {
+    if (fallbackNames.length === 0) {
       throw new RelayError(
         rateLimitCheck.reason || 'Rate limit exceeded',
         'rate_limit_error',
@@ -302,7 +363,7 @@ export async function relayRequest(
 
   const attemptedProviders = new Set<string>([effectiveProvider.name]);
 
-  for (const fbEntry of effectiveFallbackNames) {
+  for (const fbEntry of fallbackNames) {
     // Parse "provider:model" format — model is optional
     const colonIdx = fbEntry.indexOf(':');
     const fbName = colonIdx >= 0 ? fbEntry.slice(0, colonIdx) : fbEntry;
