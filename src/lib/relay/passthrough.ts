@@ -23,6 +23,7 @@ const BLOCKED_PASSTHROUGH_HEADERS = new Set([
   // Connection and transport headers - managed by fetch API
   'host',
   'content-length',
+  'content-type',
   'connection',
   'transfer-encoding',
   'upgrade',
